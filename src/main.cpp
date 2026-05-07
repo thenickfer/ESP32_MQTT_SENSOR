@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <string>
 
 #define MQTT_ID "esp1_pub"
 #define topico_status "nickfer/status"
@@ -19,6 +20,9 @@
 
 const gpio_num_t LDR_PIN = GPIO_NUM_35;
 const gpio_num_t PIR_PIN = GPIO_NUM_32;
+const gpio_num_t BUZZER_PIN = GPIO_NUM_33;
+const gpio_num_t LED_PIN = GPIO_NUM_25;
+const gpio_num_t SERVO_PIN = GPIO_NUM_12;
 
 const char* ssid = "iPhone (7)";
 const char* password = "12345678";
@@ -97,10 +101,82 @@ void publicar(){
   distanceCmLocal = distanceCm;
   xSemaphoreGive(mutexDistance);
   xSemaphoreTake(mutexServoAngle, pdMS_TO_TICKS(100));
-  distanceCmLocal = distanceCm;
+  servoAngleLocal = servoAngle;
   xSemaphoreGive(mutexServoAngle);
+  xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(100));
+  presencaLocal = presenca;
+  xSemaphoreGive(mutexPresenca);
+  xSemaphoreTake(mutexLuminosidade, pdMS_TO_TICKS(100));
+  luminosidadeLocal = luminosidade;
+  xSemaphoreGive(mutexLuminosidade);
+  xSemaphoreTake(mutexTemperatura, pdMS_TO_TICKS(100));
+  temperaturaLocal = temperatura;
+  xSemaphoreGive(mutexTemperatura);
+  xSemaphoreTake(mutexAlarme, pdMS_TO_TICKS(100));
+  alarmeLocal = alarme;
+  xSemaphoreGive(mutexAlarme);
 
-  //client.publish
+  client.publish(topico_status, (status ? "online" : "offline"));
+  std::string resultado = std::to_string(distanceCmLocal) + ";" + std::to_string(servoAngleLocal);
+  client.publish(topico_ultrassom, resultado.c_str());
+  client.publish(topico_presenca, presencaLocal ? "detectada" : "vazia" );
+  client.publish(topico_luminosidade, std::to_string(luminosidadeLocal).c_str() );
+  client.publish(topico_temperatura, std::to_string(temperaturaLocal).c_str());
+  client.publish(topico_presenca, alarmeLocal ? "ativado" : "desativado" );
+}
+
+void ldrTask(void *pvParameters) {
+  int rawValue = analogRead(LDR_PIN);
+  int lightPercent = map(rawValue, 0, 4095, 0, 100);
+  xSemaphoreTake(mutexLuminosidade, pdMS_TO_TICKS(100));
+  luminosidade = lightPercent;
+  xSemaphoreGive(mutexLuminosidade);
+  vTaskDelay(pdMS_TO_TICKS(5000));
+}
+void detectPresence() {
+  xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(100));
+  presenca = true;
+  xSemaphoreGive(mutexPresenca);
+}
+
+void detectInvasionTask(void *pvParameters) {
+  for (;;) { // Tasks precisam de um loop infinito externo
+    int lightLocal;
+
+    // 1. Busca o valor atualizado da luminosidade
+    if (xSemaphoreTake(mutexLuminosidade, pdMS_TO_TICKS(10))) {
+      lightLocal = luminosidade;
+      xSemaphoreGive(mutexLuminosidade);
+    }
+
+    bool presencaLocal;
+
+    if (xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(10))) {
+      presencaLocal = presenca;
+      xSemaphoreGive(mutexPresenca);
+    }
+
+    // 2. Verifica a condição de invasão
+    if (lightLocal > 60 && presencaLocal) {
+      // Alerta visual/sonoro (substituí delay por vTaskDelay)
+      gpio_set_level(LED_PIN, 1);
+      gpio_set_level(BUZZER_PIN, 1);
+      vTaskDelay(pdMS_TO_TICKS(500)); 
+      
+      gpio_set_level(LED_PIN, 0);
+      gpio_set_level(BUZZER_PIN, 0);
+      vTaskDelay(pdMS_TO_TICKS(500));
+
+      // 3. Atualiza o status de presença via Mutex
+      if (xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(10))) {
+        presenca = false;
+        xSemaphoreGive(mutexPresenca);
+      }
+    } else {
+      // Pequena espera se não houver invasão para não estressar a CPU
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
 }
 
 void setup() {
@@ -108,6 +184,8 @@ void setup() {
 
   gpio_set_direction(LDR_PIN, GPIO_MODE_INPUT);
   gpio_set_direction(PIR_PIN, GPIO_MODE_INPUT);
+  gpio_set_direction(BUZZER_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
 
   // Inicializando cada Mutex
   mutexStatus       = xSemaphoreCreateMutex();
@@ -125,6 +203,19 @@ void setup() {
   if (mutexStatus == NULL) { Serial.println("Erro ao criar semáforos"); }
   conectaWifi();
   client.setServer(mqtt_server, 1883);
+
+  attachInterrupt(digitalPinToInterrupt(PIR_PIN), detectPresence, RISING);
+
+  xTaskCreatePinnedToCore(
+    ldrTask,        // Function to run
+    "LDR_Reader",   // Task name
+    2048,           // Stack size (bytes)
+    NULL,           // Parameters
+    1,              // Priority
+    NULL,           // Task handle
+    1               // Core 1
+  );
+
 }
 
 void loop() {
