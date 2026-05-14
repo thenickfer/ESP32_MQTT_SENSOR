@@ -84,7 +84,7 @@ float readUltrasonicDistanceCm()
   delayMicroseconds(10);
   digitalWrite(HC_SR04_TRIG_PIN, LOW);
 
-  unsigned long duration = pulseIn(HC_SR04_ECHO_PIN, HIGH, HC_SR04_TIMEOUT_US);
+  unsigned long duration = pulseIn(HC_SR04_ECHO_PIN, HIGH);
   if (duration == 0)
   {
     return -1.0f;
@@ -96,6 +96,87 @@ float readUltrasonicDistanceCm()
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+
+bool parseBooleanPayload(const String &payload, bool &value)
+{
+  if (payload == "1" || payload == "true" || payload == "on" || payload == "ligado" || payload == "ativado")
+  {
+    value = true;
+    return true;
+  }
+
+  if (payload == "0" || payload == "false" || payload == "off" || payload == "desligado" || payload == "desativado")
+  {
+    value = false;
+    return true;
+  }
+
+  return false;
+}
+
+bool parseIntegerPayload(const String &payload, int &value)
+{
+  if (payload.length() == 0)
+  {
+    return false;
+  }
+
+  char *endPtr = nullptr;
+  long parsed = strtol(payload.c_str(), &endPtr, 10);
+  if (endPtr == payload.c_str() || *endPtr != '\0')
+  {
+    return false;
+  }
+
+  value = static_cast<int>(parsed);
+  return true;
+}
+
+void handleCommand(const char *topic, const String &payload)
+{
+  Serial.print("[COMMAND] Recebido em: ");
+  Serial.print(topic);
+  Serial.print(" = ");
+  Serial.println(payload);
+
+  bool boolValue;
+  int intValue;
+
+  if (strcmp(topic, topico_servo) == 0)
+  {
+    if (parseBooleanPayload(payload, boolValue))
+    {
+      xSemaphoreTake(mutexServo, pdMS_TO_TICKS(100));
+      servo = boolValue;
+      xSemaphoreGive(mutexServo);
+      Serial.printf("[COMANDO] servo=%d\n", boolValue ? 1 : 0);
+    }
+  }
+  else if (strcmp(topic, topico_armar) == 0)
+  {
+    if (parseBooleanPayload(payload, boolValue))
+    {
+      xSemaphoreTake(mutexArmar, pdMS_TO_TICKS(100));
+      armar = boolValue;
+      xSemaphoreGive(mutexArmar);
+      Serial.printf("[COMANDO] armar=%d\n", boolValue ? 1 : 0);
+    }
+  }
+  else if (strcmp(topic, topico_buzzer) == 0)
+  {
+    if (parseBooleanPayload(payload, boolValue))
+    {
+      xSemaphoreTake(mutexBuzzer, pdMS_TO_TICKS(100));
+      buzzer = boolValue;
+      xSemaphoreGive(mutexBuzzer);
+      Serial.printf("[COMANDO] buzzer=%d\n", boolValue ? 1 : 0);
+    }
+  }
+  else if (strcmp(topic, topico_config) == 0)
+  {
+    Serial.printf("[COMANDO] config recebido: %s\n", payload.c_str());
+  }
+}
 
 String getUniqueClientId()
 {
@@ -201,9 +282,15 @@ void publicar()
 
   client.publish(topico_status, statusJson.c_str());
   client.publish(topico_presenca, presencaJson.c_str());
-  client.publish(topico_luminosidade, std::to_string(luminosidadeLocal).c_str());
-  client.publish(topico_temperatura, std::to_string(temperaturaLocal).c_str());
-  client.publish(topico_umidade, std::to_string(umidadeLocal).c_str());
+
+  std::string luminosidadeJson = std::string("{\"luminosidade\":") + std::to_string(luminosidadeLocal) + "}";
+  std::string temperaturaJson = std::string("{\"temperatura\":") + std::to_string(temperaturaLocal) + "}";
+  std::string umidadeJson = std::string("{\"umidade\":") + std::to_string(umidadeLocal) + "}";
+
+  client.publish(topico_luminosidade, luminosidadeJson.c_str());
+  client.publish(topico_temperatura, temperaturaJson.c_str());
+  client.publish(topico_umidade, umidadeJson.c_str());
+
   client.publish(topico_alarme, alarmeJson.c_str());
   Serial.println("[PUBLICAR] Dados enviados com sucesso!");
 }
@@ -279,58 +366,69 @@ void servoUltrasonicTask(void *pvParameters)
 {
   for (;;)
   {
-    for (int angle = SERVO_MIN_ANGLE; angle <= SERVO_MAX_ANGLE; angle += SERVO_STEP_DEGREES)
+    bool servoLocal;
+    xSemaphoreTake(mutexServo, pdMS_TO_TICKS(100));
+    servoLocal = servo;
+    xSemaphoreGive(mutexServo);
+
+    if (servoLocal)
     {
-      writeServoAngle(angle);
-
-      float measuredDistance = readUltrasonicDistanceCm();
-
-      xSemaphoreTake(mutexServoAngle, pdMS_TO_TICKS(100));
-      servoAngle = angle;
-      xSemaphoreGive(mutexServoAngle);
-
-      if (measuredDistance >= 0.0f)
+      for (int angle = SERVO_MIN_ANGLE; angle <= SERVO_MAX_ANGLE; angle += SERVO_STEP_DEGREES)
       {
-        xSemaphoreTake(mutexDistance, pdMS_TO_TICKS(100));
-        distanceCm = measuredDistance;
-        xSemaphoreGive(mutexDistance);
-        Serial.printf("[SERVO] angle=%d distance=%.2fcm\n", angle, measuredDistance);
+        writeServoAngle(angle);
+
+        float measuredDistance = readUltrasonicDistanceCm();
+        xSemaphoreTake(mutexServoAngle, pdMS_TO_TICKS(100));
+        servoAngle = angle;
+        xSemaphoreGive(mutexServoAngle);
+
+        if (measuredDistance >= 0.0f)
+        {
+          xSemaphoreTake(mutexDistance, pdMS_TO_TICKS(100));
+          distanceCm = measuredDistance;
+          xSemaphoreGive(mutexDistance);
+          Serial.printf("[SERVO] angle=%d distance=%.2fcm\n", angle, measuredDistance);
+        }
+        else
+        {
+          Serial.printf("[SERVO] angle=%d distance=timeout\n", angle);
+        }
+
+        publish_ultrasound();
+
+        vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_DELAY_MS));
       }
-      else
+
+      for (int angle = SERVO_MAX_ANGLE; angle >= SERVO_MIN_ANGLE; angle -= SERVO_STEP_DEGREES)
       {
-        Serial.printf("[SERVO] angle=%d distance=timeout\n", angle);
+        writeServoAngle(angle);
+
+        float measuredDistance = readUltrasonicDistanceCm();
+
+        xSemaphoreTake(mutexServoAngle, pdMS_TO_TICKS(100));
+        servoAngle = angle;
+        xSemaphoreGive(mutexServoAngle);
+
+        if (measuredDistance >= 0.0f)
+        {
+          xSemaphoreTake(mutexDistance, pdMS_TO_TICKS(100));
+          distanceCm = measuredDistance;
+          xSemaphoreGive(mutexDistance);
+          Serial.printf("[SERVO] angle=%d distance=%.2fcm\n", angle, measuredDistance);
+        }
+        else
+        {
+          Serial.printf("[SERVO] angle=%d distance=timeout\n", angle);
+        }
+
+        publish_ultrasound();
+
+        vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_DELAY_MS));
       }
-
-      publish_ultrasound();
-
-      vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_DELAY_MS));
     }
-
-    for (int angle = SERVO_MAX_ANGLE; angle >= SERVO_MIN_ANGLE; angle -= SERVO_STEP_DEGREES)
+    else
     {
-      writeServoAngle(angle);
-
-      float measuredDistance = readUltrasonicDistanceCm();
-
-      xSemaphoreTake(mutexServoAngle, pdMS_TO_TICKS(100));
-      servoAngle = angle;
-      xSemaphoreGive(mutexServoAngle);
-
-      if (measuredDistance >= 0.0f)
-      {
-        xSemaphoreTake(mutexDistance, pdMS_TO_TICKS(100));
-        distanceCm = measuredDistance;
-        xSemaphoreGive(mutexDistance);
-        Serial.printf("[SERVO] angle=%d distance=%.2fcm\n", angle, measuredDistance);
-      }
-      else
-      {
-        Serial.printf("[SERVO] angle=%d distance=timeout\n", angle);
-      }
-
-      publish_ultrasound();
-
-      vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_DELAY_MS));
+      vTaskDelay(pdMS_TO_TICKS(500));
     }
   }
 }
@@ -342,7 +440,7 @@ void detectInvasionTask(void *pvParameters)
     int lightLocal;
 
     // 1. Busca o valor atualizado da luminosidade
-    if (xSemaphoreTake(mutexLuminosidade, pdMS_TO_TICKS(10)))
+    if (xSemaphoreTake(mutexLuminosidade, pdMS_TO_TICKS(100)))
     {
       lightLocal = luminosidade;
       xSemaphoreGive(mutexLuminosidade);
@@ -350,7 +448,7 @@ void detectInvasionTask(void *pvParameters)
 
     bool presencaLocal;
 
-    if (xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(10)))
+    if (xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(100)))
     {
       presencaLocal = presenca;
       xSemaphoreGive(mutexPresenca);
@@ -358,10 +456,16 @@ void detectInvasionTask(void *pvParameters)
     }
 
     bool alarmActive = (lightLocal > 60 && presencaLocal);
-    if (xSemaphoreTake(mutexAlarme, pdMS_TO_TICKS(10)))
+    if (xSemaphoreTake(mutexAlarme, pdMS_TO_TICKS(100)))
     {
       alarme = alarmActive;
       xSemaphoreGive(mutexAlarme);
+    }
+    bool buzz = false;
+    if (xSemaphoreTake(mutexBuzzer, pdMS_TO_TICKS(100)))
+    {
+      buzz = buzzer;
+      xSemaphoreGive(mutexBuzzer);
     }
 
     // 2. Verifica a condição de invasão
@@ -377,13 +481,13 @@ void detectInvasionTask(void *pvParameters)
       vTaskDelay(pdMS_TO_TICKS(500));
 
       // 3. Atualiza o status de presença via Mutex
-      if (xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(10)))
+      if (xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(100)))
       {
         presenca = false;
         xSemaphoreGive(mutexPresenca);
       }
 
-      if (xSemaphoreTake(mutexAlarme, pdMS_TO_TICKS(10)))
+      if (xSemaphoreTake(mutexAlarme, pdMS_TO_TICKS(100)))
       {
         alarme = false;
         xSemaphoreGive(mutexAlarme);
@@ -434,13 +538,15 @@ void setup()
   client.setServer(mqtt_server, 1883);
   client.setCallback([](char *topic, byte *payload, unsigned int length)
                      {
-    Serial.print("[MQTT] Mensagem em: ");
-    Serial.print(topic);
-    Serial.print(" = ");
-    for (int i = 0; i < length; i++) {
-      Serial.print((char)payload[i]);
+    String message;
+    message.reserve(length);
+    for (unsigned int i = 0; i < length; i++)
+    {
+      message += static_cast<char>(payload[i]);
     }
-    Serial.println(); });
+    message.trim();
+    message.toLowerCase();
+    handleCommand(topic, message); });
 
   xSemaphoreTake(mutexPresenca, pdMS_TO_TICKS(100));
   presenca = (digitalRead(PIR_PIN) == HIGH);
